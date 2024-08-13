@@ -26,6 +26,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # MongoDB connection
 client = MongoClient("mongodb+srv://sanmi2009:oeVE5JKWBEjf9BlH@cluster0.n1cvn6z.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 db = client["registration"]
@@ -74,7 +75,8 @@ class SignUp(BaseModel):
     confirmPassword: str
 
 class SignIn(BaseModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
+    phoneNumber: Optional[str] = None
     password: str
 
 class Booking(BaseModel):
@@ -100,14 +102,23 @@ class ResetPasswordForm(BaseModel):
 def verify_password(plain_password, hashed_password):
     return pwd_cxt.verify(plain_password, hashed_password)
 
-def get_user(email: str):
+def get_user_by_email(email: str):
     return users_collection.find_one({"email": email})
 
-def authenticate_user(email: str, password: str):
-    user = get_user(email)
+def get_user_by_phone(phoneNumber: str):
+    return users_collection.find_one({"phoneNumber": phoneNumber})
+
+def authenticate_user(email: Optional[str], phoneNumber: Optional[str], password: str):
+    user = None
+    if email:
+        user = get_user_by_email(email)
+    elif phoneNumber:
+        user = get_user_by_phone(phoneNumber)
+    
     if not user or not verify_password(password, user["password"]):
         return False
     return user
+
 
 async def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -128,17 +139,17 @@ async def create_reset_token(email: str):
 
 # Routes
 @app.post("/token", response_model=Token)
-async def sign_in_for_access_token(email: str, password: str):
-    user = authenticate_user(email, password)
+async def sign_in_for_access_token(email: str = None, phoneNumber: str = None, password: str = Body(...)):
+    user = authenticate_user(email, phoneNumber, password)
     if not user:
         raise HTTPException(
             status_code=401,
-            detail="Incorrect username or password",
+            detail="Incorrect email/phone number or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = await create_access_token(
-        data={"sub": user["email"]}, expires_delta=access_token_expires
+        data={"sub": user["email"] if user["email"] else user["phoneNumber"]}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -158,7 +169,7 @@ async def read_users_me(credentials: HTTPAuthorizationCredentials = Depends(bear
         token_data = TokenData(email=email)
     except JWTError:
         raise credentials_exception
-    user = get_user(token_data.email)
+    user = get_user_by_email(token_data.email)
     if user is None:
         raise credentials_exception
     return user
@@ -176,12 +187,12 @@ async def sign_up_user(user: SignUp):
 
 @app.post("/SignIn")
 async def sign_in_user(form_data: SignIn):
-    user = get_user(form_data.email)
-    if not user or not pwd_cxt.verify(form_data.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    user = authenticate_user(form_data.email, form_data.phoneNumber, form_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email/phone number or password")
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = await create_access_token(
-        data={"sub": user["email"]}, expires_delta=access_token_expires
+        data={"sub": user["email"] if user["email"] else user["phoneNumber"]}, expires_delta=access_token_expires
     )
     return {"message": "SignIn successfully", "accessToken": access_token}
 
@@ -200,7 +211,7 @@ async def sign_out_user(credentials: HTTPAuthorizationCredentials = Depends(bear
 
 @app.post("/forget_password")
 async def forget_password(request: ResetPasswordRequest):
-    user = get_user(request.email)
+    user = get_user_by_email(request.email)
     if user is None:
         raise HTTPException(status_code=404, detail="Email not found")
     
@@ -221,7 +232,7 @@ async def reset_password(form_data: ResetPasswordForm):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    user = get_user(email)
+    user = get_user_by_email(email)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -277,7 +288,7 @@ async def paystack_payment(payment: PaystackPayment):
         raise HTTPException(status_code=response.status_code, detail=response.json())
     return response.json()
 
-# # Running the application with Uvicorn
+# Running the application with Uvicorn
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 8000))
 #     uvicorn.run("main:app", host="0.0.0.0", port=port)
