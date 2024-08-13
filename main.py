@@ -1,51 +1,4 @@
-# # from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel, EmailStr
-# import requests
-
-# app = FastAPI()
-
-# class Payments(BaseModel):
-#     email: EmailStr
-#     amount: str
-
-# class PaystackWebhookPayload(BaseModel):
-#     event: str
-#     data: dict
-
-# def accept_payments(email: str, amount: str):
-#     url = "https://api.paystack.co/transaction/initialize"
-#     headers = {
-#         "Authorization": f"Bearer YOUR-PAYSTACK-SECRET-KEY"
-#     }
-#     data = {
-#         "email": email,
-#         "amount": amount  # amount should be multiplied by 100 if currency is in GHS
-#     }
-#     try:
-#         response = requests.post(url, headers=headers, data=data)
-#         response.raise_for_status()
-#         return response.json()["data"]["authorization_url"]
-#     except requests.exceptions.HTTPError as e:
-#         return None
-
-# @app.post("/initialize-transaction")
-# async def initialize_payment(payment_details: Payments):
-#     payment_url = accept_payments(email=payment_details.email, amount=payment_details.amount)
-#     if payment_url is None:
-#         return HTTPException(status_code=400, detail="Invalid request")
-#     return {"payment_url": payment_url}
-
-# @app.post("/paystack-webhook")
-# async def paystack_webhook(payload: PaystackWebhookPayload):
-#     if payload.event == "charge.success":
-#         payment_data = payload.data
-#         # Do something with payment data
-#         # Example: Save payment data to database, send email to customer, update order status, etc.
-#         return {"message": "Payment successful"}
-#     return {"message": "Payment failed"}                      
-
-
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from pymongo import MongoClient
@@ -55,15 +8,24 @@ from typing import List, Optional
 from bson import ObjectId
 from dotenv import load_dotenv
 import os
-import uvicorn 
+import uvicorn
 import requests
 from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
+# CORS middleware should be added after the app instance is created
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # MongoDB connection
 client = MongoClient("mongodb+srv://sanmi2009:oeVE5JKWBEjf9BlH@cluster0.n1cvn6z.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 db = client["registration"]
@@ -77,6 +39,7 @@ PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 # JWT configuration
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+RESET_TOKEN_EXPIRE_MINUTES = 15  # Token expiration time for password reset
 
 # HTTP Bearer security scheme
 bearer_scheme = HTTPBearer()
@@ -126,6 +89,13 @@ class PaystackPayment(BaseModel):
     email: EmailStr
     amount: int
 
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordForm(BaseModel):
+    token: str
+    new_password: str
+
 # Utility functions
 def verify_password(plain_password, hashed_password):
     return pwd_cxt.verify(plain_password, hashed_password)
@@ -149,9 +119,16 @@ async def create_access_token(data: dict, expires_delta: Optional[timedelta] = N
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+async def create_reset_token(email: str):
+    to_encode = {"sub": email}
+    expire = datetime.utcnow() + timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
 # Routes
 @app.post("/token", response_model=Token)
-async def SignIn_for_access_token(email: str, password: str):
+async def sign_in_for_access_token(email: str, password: str):
     user = authenticate_user(email, password)
     if not user:
         raise HTTPException(
@@ -187,7 +164,7 @@ async def read_users_me(credentials: HTTPAuthorizationCredentials = Depends(bear
     return user
 
 @app.post("/SignUp")
-async def Sign_Up_user(user: SignUp):
+async def sign_up_user(user: SignUp):
    if user.password != user.confirmPassword:
       raise HTTPException(status_code=400, detail="Passwords do not match")
    hashed_password = pwd_cxt.hash(user.password)
@@ -198,7 +175,7 @@ async def Sign_Up_user(user: SignUp):
    return {"message": "User SignUp successfully"}
 
 @app.post("/SignIn")
-async def Sign_In_user(form_data: SignIn):
+async def sign_in_user(form_data: SignIn):
     user = get_user(form_data.email)
     if not user or not pwd_cxt.verify(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -209,7 +186,7 @@ async def Sign_In_user(form_data: SignIn):
     return {"message": "SignIn successfully", "accessToken": access_token}
 
 @app.post("/SignOut")
-async def signOut_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+async def sign_out_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -222,12 +199,36 @@ async def signOut_user(credentials: HTTPAuthorizationCredentials = Depends(beare
         raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/forget_password")
-async def forget_password(email: str):
-    user = users_collection.find_one({"email": email})
+async def forget_password(request: ResetPasswordRequest):
+    user = get_user(request.email)
     if user is None:
-        raise HTTPException(status_code=404, detail="email not found")
-    # Send password reset email (implementation needed)
-    return {"message": "password reset email sent successfully"}
+        raise HTTPException(status_code=404, detail="Email not found")
+    
+    reset_token = await create_reset_token(request.email)
+    
+    # Here you would typically send the reset token via email to the user.
+    # send_reset_email(user["email"], reset_token)  # Implement this function
+    
+    return {"message": "Password reset token sent successfully", "reset_token": reset_token}  # For testing purposes
+
+@app.post("/reset_password")
+async def reset_password(form_data: ResetPasswordForm):
+    try:
+        payload = jwt.decode(form_data.token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = get_user(email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    hashed_password = pwd_cxt.hash(form_data.new_password)
+    users_collection.update_one({"email": email}, {"$set": {"password": hashed_password}})
+    
+    return {"message": "Password has been reset successfully"}
 
 @app.post("/booking")
 async def booking_slot(booking: Booking, credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
@@ -276,10 +277,7 @@ async def paystack_payment(payment: PaystackPayment):
         raise HTTPException(status_code=response.status_code, detail=response.json())
     return response.json()
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
-
+# # Running the application with Uvicorn
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 8000))
-#     uvicorn.run("main:app", host="0.0.0.0", port=8000)
+#     uvicorn.run("main:app", host="0.0.0.0", port=port)
